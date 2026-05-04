@@ -1,0 +1,1706 @@
+    "cli": {
+    "version": ">= 5.0.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "distribution": "internal",
+      "android": {
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "ios": {
+        "buildConfiguration": "Debug"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    },
+    "production": {
+      "distribution": "store",
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    }
+  }
+}// Load environment variables with proper priority (system > .env)
+import "./scripts/load-env.js";
+import type { ExpoConfig } from "expo/config";
+
+// Bundle ID format: space.manus.<project_name_dots>.<timestamp>
+// e.g., "my-app" created at 2024-01-15 10:30:45 -> "space.manus.my.app.t20240115103045"
+// Bundle ID can only contain letters, numbers, and dots
+// Android requires each dot-separated segment to start with a letter
+const rawBundleId = "space.manus.secure.chat.app.t20260502083512";
+const bundleId =
+  rawBundleId
+    .replace(/[-_]/g, ".") // Replace hyphens/underscores with dots
+    .replace(/[^a-zA-Z0-9.]/g, "") // Remove invalid chars
+    .replace(/\.+/g, ".") // Collapse consecutive dots
+    .replace(/^\.+|\.+$/g, "") // Trim leading/trailing dots
+    .toLowerCase()
+    .split(".")
+    .map((segment) => {
+      // Android requires each segment to start with a letter
+      // Prefix with 'x' if segment starts with a digit
+      return /^[a-zA-Z]/.test(segment) ? segment : "x" + segment;
+    })
+    .join(".") || "space.manus.app";
+// Extract timestamp from bundle ID and prefix with "manus" for deep link scheme
+// e.g., "space.manus.my.app.t20240115103045" -> "manus20240115103045"
+const timestamp = bundleId.split(".").pop()?.replace(/^t/, "") ?? "";
+const schemeFromBundleId = `manus${timestamp}`;
+
+const env = {
+  // App branding - update these values directly (do not use env vars)
+  appName: "SecureChat",
+  appSlug: "secure-chat-app",
+  // S3 URL of the app logo - set this to the URL returned by generate_image when creating custom logo
+  // Leave empty to use the default icon from assets/images/icon.png
+  logoUrl: "https://d2xsxph8kpxj0f.cloudfront.net/310519663511036759/Ke9CvNAtD3pVGseafwodWy/icon-D76yFceNx3446TLPHEEi3N.png",
+  scheme: schemeFromBundleId,
+  iosBundleId: bundleId,
+  androidPackage: bundleId,
+};
+
+const config: ExpoConfig = {
+  name: env.appName,
+  slug: env.appSlug,
+  version: "1.0.0",
+  orientation: "portrait",
+  icon: env.logoUrl || "./assets/images/icon.png",
+  scheme: env.scheme,
+  userInterfaceStyle: "automatic",
+  newArchEnabled: true,
+  ios: {
+    supportsTablet: true,
+    bundleIdentifier: env.iosBundleId,
+    "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+  },
+  android: {
+    adaptiveIcon: {
+      backgroundColor: "#E6F4FE",
+      foregroundImage: env.logoUrl || "./assets/images/android-icon-foreground.png",
+      backgroundImage: "./assets/images/android-icon-background.png",
+      monochromeImage: "./assets/images/android-icon-monochrome.png",
+    },
+    edgeToEdgeEnabled: true,
+    predictiveBackGestureEnabled: false,
+    package: env.androidPackage,
+    permissions: ["POST_NOTIFICATIONS"],
+    intentFilters: [
+      {
+        action: "VIEW",
+        autoVerify: true,
+        data: [
+          {
+            scheme: env.scheme,
+            host: "*",
+          },
+        ],
+        category: ["BROWSABLE", "DEFAULT"],
+      },
+    ],
+  },
+  web: {
+    bundler: "metro",
+    output: "static",
+    favicon: env.logoUrl || "./assets/images/favicon.png",
+  },
+  plugins: [
+    "expo-router",
+    [
+      "expo-audio",
+      {
+        microphonePermission: "Allow $(PRODUCT_NAME) to access your microphone.",
+      },
+    ],
+    [
+      "expo-video",
+      {
+        supportsBackgroundPlayback: true,
+        supportsPictureInPicture: true,
+      },
+    ],
+    [
+      "expo-splash-screen",
+      {
+        image: env.logoUrl || "./assets/images/splash-icon.png",
+        imageWidth: 200,
+        resizeMode: "contain",
+        backgroundColor: "#ffffff",
+        dark: {
+          backgroundColor: "#000000",
+        },
+      },
+    ],
+    [
+      "expo-build-properties",
+      {
+        android: {
+          buildArchs: ["armeabi-v7a", "arm64-v8a"],
+          minSdkVersion: 24,
+        },
+      },
+    ],
+  ],
+  experiments: {
+    typedRoutes: true,
+    reactCompiler: true,
+  },
+};
+
+// Add CLI configuration for app versioning
+(config as any).cli = { appVersionSource: "local" };
+
+export default config;import React, { useState, useEffect } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+} from "react-native";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { MessageBubble } from "@/components/message-bubble";
+import { useAuth } from "@/lib/auth-context";
+import { useConversation } from "@/lib/conversation-context";
+
+interface Message {
+  id: number;
+  senderId: number;
+  recipientId: number;
+  content: string;
+  encryptedPayload: string;
+  isRead: boolean;
+  isDeleted: boolean;
+  createdAt: string;
+  deliveryStatus: "sending" | "sent" | "delivered" | "read";
+}
+
+export default function ConversationScreen() {
+  const router = useRouter();
+  const { user } = useAuth();
+  const { messages, setMessages, setIsLoading, isLoading } = useConversation();
+  const { contactId, contactName } = useLocalSearchParams();
+
+  const [messageText, setMessageText] = useState("");
+  const [isSending, setIsSending] = useState(false);
+
+  useEffect(() => {
+    // TODO: Load conversation messages from API
+    // setIsLoading(true);
+    // try {
+    //   const msgs = await trpc.messages.getConversation.query({
+    //     contactId: parseInt(contactId as string),
+    //   });
+    //   setMessages(msgs);
+    // } finally {
+    //   setIsLoading(false);
+    // }
+  }, [contactId]);
+
+  const handleSendMessage = async () => {
+    if (!messageText.trim() || !user) return;
+
+    setIsSending(true);
+    try {
+      // TODO: Implement message encryption and sending
+      // 1. Encrypt message with recipient's public key
+      // 2. Send encrypted message to server
+      // 3. Add message to local state with "sent" status
+      // 4. Update status to "delivered" when server confirms
+
+      const newMessage: Message = {
+        id: Date.now(),
+        senderId: user.id,
+        recipientId: parseInt(contactId as string),
+        content: messageText,
+        encryptedPayload: "",
+        isRead: false,
+        isDeleted: false,
+        createdAt: new Date().toISOString(),
+        deliveryStatus: "sending",
+      };
+
+      setMessages([...messages, newMessage]);
+      setMessageText("");
+    } catch (error) {
+      console.error("Failed to send message:", error);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const renderMessage = ({ item }: { item: Message }) => {
+    const isSentByUser = item.senderId === user?.id;
+    const timestamp = new Date(item.createdAt).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    return (
+      <MessageBubble
+        content={item.content}
+        isSentByUser={isSentByUser}
+        timestamp={timestamp}
+        deliveryStatus={item.deliveryStatus}
+        onLongPress={() => {
+          // TODO: Show delete/copy options
+        }}
+      />
+    );
+  };
+
+  return (
+    <ScreenContainer className="p-0">
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        className="flex-1"
+      >
+        {/* Header */}
+        <View className="bg-surface border-b border-border p-4 flex-row items-center justify-between">
+          <TouchableOpacity onPress={() => router.back()}>
+            <Text className="text-primary font-semibold">← Back</Text>
+          </TouchableOpacity>
+          <Text className="text-lg font-bold text-foreground">{contactName}</Text>
+          <View className="w-12" />
+        </View>
+
+        {/* Messages List */}
+        {isLoading ? (
+          <View className="flex-1 items-center justify-center">
+            <ActivityIndicator size="large" color="#0a7ea4" />
+          </View>
+        ) : messages.length === 0 ? (
+          <View className="flex-1 items-center justify-center gap-3 p-4">
+            <Text className="text-lg font-semibold text-foreground">
+              No messages yet
+            </Text>
+            <Text className="text-sm text-muted text-center">
+              Start the conversation by sending a message
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={messages}
+            keyExtractor={(item) => item.id.toString()}
+            renderItem={renderMessage}
+            contentContainerStyle={{ padding: 16 }}
+            inverted
+          />
+        )}
+
+        {/* Message Input */}
+        <View className="bg-surface border-t border-border p-4 flex-row gap-2 items-end">
+          <TextInput
+            placeholder="Type a message..."
+            value={messageText}
+            onChangeText={setMessageText}
+            multiline
+            maxLength={500}
+            className="flex-1 bg-background border border-border rounded-lg px-3 py-2 text-foreground"
+            placeholderTextColor="#687076"
+            editable={!isSending}
+          />
+          <TouchableOpacity
+            onPress={handleSendMessage}
+            disabled={!messageText.trim() || isSending}
+            className={`rounded-lg p-3 ${
+              messageText.trim() && !isSending
+                ? "bg-primary"
+                : "bg-primary/50"
+            }`}
+          >
+            {isSending ? (
+              <ActivityIndicator color="#ffffff" size="small" />
+            ) : (
+              <Text className="text-white font-bold">Send</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
+    </ScreenContainer>
+  );
+}import React from "react";
+import { View, Text, TouchableOpacity } from "react-native";
+
+interface MessageBubbleProps {
+  content: string;
+  isSentByUser: boolean;
+  timestamp: string;
+  deliveryStatus?: "sending" | "sent" | "delivered" | "read";
+  onLongPress?: () => void;
+}
+
+export function MessageBubble({
+  content,
+  isSentByUser,
+  timestamp,
+  deliveryStatus,
+  onLongPress,
+}: MessageBubbleProps) {
+  const getStatusIcon = () => {
+    switch (deliveryStatus) {
+      case "sending":
+        return "⏱";
+      case "sent":
+        return "✓";
+      case "delivered":
+        return "✓✓";
+      case "read":
+        return "✓✓";
+      default:
+        return "";
+    }
+  };
+
+  const getStatusColor = () => {
+    return deliveryStatus === "read" ? "text-success" : "text-white/70";
+  };
+
+  return (
+    <TouchableOpacity
+      onLongPress={onLongPress}
+      className={`flex-row mb-2 ${isSentByUser ? "justify-end" : "justify-start"}`}
+    >
+      <View
+        className={`max-w-xs rounded-lg px-4 py-2 ${
+          isSentByUser
+            ? "bg-primary rounded-br-none"
+            : "bg-surface rounded-bl-none"
+        }`}
+      >
+        <Text
+          className={`text-base ${isSentByUser ? "text-white" : "text-foreground"}`}
+        >
+          {content}
+        </Text>
+        <View className="flex-row items-center gap-1 mt-1">
+          <Text
+            className={`text-xs ${
+              isSentByUser ? "text-white/70" : "text-muted"
+            }`}
+          >
+            {timestamp}
+          </Text>
+          {isSentByUser && (
+            <Text className={`text-xs ${getStatusColor()}`}>
+              {getStatusIcon()}
+            </Text>
+          )}
+        </View>
+      </View>
+    </TouchableOpacity>
+  );import React, { createContext, useContext, useState, useCallback, ReactNode } from "react";
+
+export interface Message {
+  id: number;
+  senderId: number;
+  recipientId: number;
+  content: string;
+  encryptedPayload: string;
+  isRead: boolean;
+  isDeleted: boolean;
+  createdAt: string;
+  deliveryStatus: "sending" | "sent" | "delivered" | "read";
+}
+
+export interface ConversationContextType {
+  messages: Message[];
+  currentContactId: number | null;
+  isLoading: boolean;
+  addMessage: (message: Message) => void;
+  updateMessageStatus: (messageId: number, status: Message["deliveryStatus"]) => void;
+  deleteMessage: (messageId: number) => void;
+  setCurrentContact: (contactId: number | null) => void;
+  setMessages: (messages: Message[]) => void;
+  setIsLoading: (loading: boolean) => void;
+}
+
+const ConversationContext = createContext<ConversationContextType | undefined>(undefined);
+
+export function ConversationProvider({ children }: { children: ReactNode }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [currentContactId, setCurrentContactId] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const addMessage = useCallback((message: Message) => {
+    setMessages((prev) => [...prev, message]);
+  }, []);
+
+  const updateMessageStatus = useCallback(
+    (messageId: number, status: Message["deliveryStatus"]) => {
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === messageId ? { ...msg, deliveryStatus: status } : msg
+        )
+      );
+    },
+    []
+  );
+
+  const deleteMessage = useCallback((messageId: number) => {
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === messageId ? { ...msg, isDeleted: true } : msg
+      )
+    );
+  }, []);
+
+  return (
+    <ConversationContext.Provider
+      value={{
+        messages,
+        currentContactId,
+        isLoading,
+        addMessage,
+        updateMessageStatus,
+        deleteMessage,
+        setCurrentContact: setCurrentContactId,
+        setMessages,
+        setIsLoading,
+      }}
+    >
+      {children}
+    </ConversationContext.Provider>
+  );
+}
+
+export function useConversation() {
+  const context = useContext(ConversationContext);
+  if (context === undefined) {
+    throw new Error("useConversation must be used within a ConversationProvider");
+  }
+  return context;
+}/**
+ * Message encryption/decryption for SecureChat
+ * Implements hybrid encryption: RSA for key exchange, AES-256-GCM for message encryption
+ */
+
+import * as crypto from "crypto";
+
+export interface EncryptedMessage {
+  encryptedMessage: string; // Base64-encoded AES-256-GCM ciphertext
+  encryptedAesKey: string; // Base64-encoded RSA-encrypted AES key
+  iv: string; // Base64-encoded IV
+  authTag: string; // Base64-encoded authentication tag
+}
+
+/**
+ * Encrypt a message for a recipient
+ * 1. Generate random AES-256 key
+ * 2. Encrypt message with AES-256-GCM
+ * 3. Encrypt AES key with recipient's RSA public key
+ */
+export function encryptMessageForRecipient(
+  plaintext: string,
+  recipientPublicKeyPem: string
+): EncryptedMessage {
+  // Generate random AES-256 key and IV
+  const aesKey = crypto.randomBytes(32);
+  const iv = crypto.randomBytes(16);
+
+  // Encrypt message with AES-256-GCM
+  const cipher = crypto.createCipheriv("aes-256-gcm", aesKey, iv);
+  let encryptedMessage = cipher.update(plaintext, "utf8", "hex");
+  encryptedMessage += cipher.final("hex");
+  const authTag = cipher.getAuthTag();
+
+  // Encrypt AES key with RSA public key
+  const encryptedAesKey = crypto.publicEncrypt(
+    {
+      key: recipientPublicKeyPem,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    aesKey
+  );
+
+  return {
+    encryptedMessage: Buffer.from(encryptedMessage, "hex").toString("base64"),
+    encryptedAesKey: encryptedAesKey.toString("base64"),
+    iv: iv.toString("base64"),
+    authTag: authTag.toString("base64"),
+  };
+}
+
+/**
+ * Decrypt a message using recipient's private key
+ * 1. Decrypt AES key with RSA private key
+ * 2. Decrypt message with AES-256-GCM
+ */
+export function decryptMessage(
+  encrypted: EncryptedMessage,
+  privateKeyPem: string
+): string {
+  // Decrypt AES key with RSA private key
+  const encryptedAesKeyBuffer = Buffer.from(encrypted.encryptedAesKey, "base64");
+  const aesKey = crypto.privateDecrypt(
+    {
+      key: privateKeyPem,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    encryptedAesKeyBuffer
+  );
+
+  // Decrypt message with AES-256-GCM
+  const iv = Buffer.from(encrypted.iv, "base64");
+  const authTag = Buffer.from(encrypted.authTag, "base64");
+  const encryptedMessageBuffer = Buffer.from(encrypted.encryptedMessage, "base64");
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", aesKey, iv);
+  decipher.setAuthTag(authTag);
+
+  let decrypted = decipher.update(encryptedMessageBuffer, undefined, "utf8");
+  decrypted += decipher.final("utf8");
+
+  return decrypted;
+}
+
+/**
+ * Serialize encrypted message to JSON string for storage/transmission
+ */
+export function serializeEncryptedMessage(encrypted: EncryptedMessage): string {
+  return JSON.stringify(encrypted);
+}
+
+/**
+ * Deserialize encrypted message from JSON string
+ */
+export function deserializeEncryptedMessage(json: string): EncryptedMessage {
+  return JSON.parse(json);
+}import "@/global.css";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Stack } from "expo-router";
+import { StatusBar } from "expo-status-bar";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
+import "react-native-reanimated";
+import { Platform } from "react-native";
+import "@/lib/_core/nativewind-pressable";
+import { ThemeProvider } from "@/lib/theme-provider";
+import {
+  SafeAreaFrameContext,
+  SafeAreaInsetsContext,
+  SafeAreaProvider,
+  initialWindowMetrics,
+} from "react-native-safe-area-context";
+import type { EdgeInsets, Metrics, Rect } from "react-native-safe-area-context";
+
+import { trpc, createTRPCClient } from "@/lib/trpc";
+import { initManusRuntime, subscribeSafeAreaInsets } from "@/lib/_core/manus-runtime";
+import { AuthProvider } from "@/lib/auth-context";
+
+const DEFAULT_WEB_INSETS: EdgeInsets = { top: 0, right: 0, bottom: 0, left: 0 };
+const DEFAULT_WEB_FRAME: Rect = { x: 0, y: 0, width: 0, height: 0 };
+
+export const unstable_settings = {
+  anchor: "(tabs)",
+};
+
+export default function RootLayout() {
+  const initialInsets = initialWindowMetrics?.insets ?? DEFAULT_WEB_INSETS;
+  const initialFrame = initialWindowMetrics?.frame ?? DEFAULT_WEB_FRAME;
+
+  const [insets, setInsets] = useState<EdgeInsets>(initialInsets);
+  const [frame, setFrame] = useState<Rect>(initialFrame);
+
+  // Initialize Manus runtime for cookie injection from parent container
+  useEffect(() => {
+    initManusRuntime();
+  }, []);
+
+  const handleSafeAreaUpdate = useCallback((metrics: Metrics) => {
+    setInsets(metrics.insets);
+    setFrame(metrics.frame);
+  }, []);
+
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    const unsubscribe = subscribeSafeAreaInsets(handleSafeAreaUpdate);
+    return () => unsubscribe();
+  }, [handleSafeAreaUpdate]);
+
+  // Create clients once and reuse them
+  const [queryClient] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: {
+            // Disable automatic refetching on window focus for mobile
+            refetchOnWindowFocus: false,
+            // Retry failed requests once
+            retry: 1,
+          },
+        },
+      }),
+  );
+  const [trpcClient] = useState(() => createTRPCClient());
+
+  // Ensure minimum 8px padding for top and bottom on mobile
+  const providerInitialMetrics = useMemo(() => {
+    const metrics = initialWindowMetrics ?? { insets: initialInsets, frame: initialFrame };
+    return {
+      ...metrics,
+      insets: {
+        ...metrics.insets,
+        top: Math.max(metrics.insets.top, 16),
+        bottom: Math.max(metrics.insets.bottom, 12),
+      },
+    };
+  }, [initialInsets, initialFrame]);
+
+  const content = (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <AuthProvider>
+        <trpc.Provider client={trpcClient} queryClient={queryClient}>
+          <QueryClientProvider client={queryClient}>
+          {/* Default to hiding native headers so raw route segments don't appear (e.g. "(tabs)", "products/[id]"). */}
+          {/* If a screen needs the native header, explicitly enable it and set a human title via Stack.Screen options. */}
+          {/* in order for ios apps tab switching to work properly, use presentation: "fullScreenModal" for login page, whenever you decide to use presentation: "modal*/}
+          <Stack screenOptions={{ headerShown: false }}>
+            <Stack.Screen name="login" />
+            <Stack.Screen name="register" />
+            <Stack.Screen name="(tabs)" />
+            <Stack.Screen name="oauth/callback" />
+          </Stack>
+          <StatusBar style="auto" />
+          </QueryClientProvider>
+        </trpc.Provider>
+      </AuthProvider>
+    </GestureHandlerRootView>
+  );
+
+  const shouldOverrideSafeArea = Platform.OS === "web";
+
+  if (shouldOverrideSafeArea) {
+    return (
+      <ThemeProvider>
+        <SafeAreaProvider initialMetrics={providerInitialMetrics}>
+          <SafeAreaFrameContext.Provider value={frame}>
+            <SafeAreaInsetsContext.Provider value={insets}>
+              {content}
+            </SafeAreaInsetsContext.Provider>
+          </SafeAreaFrameContext.Provider>
+        </SafeAreaProvider>
+      </ThemeProvider>
+    );
+  }
+
+  return (
+    <ThemeProvider>
+      <SafeAreaProvider initialMetrics={providerInitialMetrics}>{content}</SafeAreaProvider>
+    </ThemeProvider>
+  );
+}// Fallback for using MaterialIcons on Android and web.
+
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
+import { SymbolWeight, SymbolViewProps } from "expo-symbols";
+import { ComponentProps } from "react";
+import { OpaqueColorValue, type StyleProp, type TextStyle } from "react-native";
+
+type IconMapping = Record<SymbolViewProps["name"], ComponentProps<typeof MaterialIcons>["name"]>;
+type IconSymbolName = keyof typeof MAPPING;
+
+/**
+ * Add your SF Symbols to Material Icons mappings here.
+ * - see Material Icons in the [Icons Directory](https://icons.expo.fyi).
+ * - see SF Symbols in the [SF Symbols](https://developer.apple.com/sf-symbols/) app.
+ */
+const MAPPING = {
+  "house.fill": "home",
+  "paperplane.fill": "send",
+  "chevron.left.forwardslash.chevron.right": "code",
+  "chevron.right": "chevron-right",
+  "person.2.fill": "people",
+  "gearshape.fill": "settings",
+} as IconMapping;
+
+/**
+ * An icon component that uses native SF Symbols on iOS, and Material Icons on Android and web.
+ * This ensures a consistent look across platforms, and optimal resource usage.
+ * Icon `name`s are based on SF Symbols and require manual mapping to Material Icons.
+ */
+export function IconSymbol({
+  name,
+  size = 24,
+  color,
+  style,
+}: {
+  name: IconSymbolName;
+  size?: number;
+  color: string | OpaqueColorValue;
+  style?: StyleProp<TextStyle>;
+  weight?: SymbolWeight;
+}) {
+  return <MaterialIcons color={color} size={size} name={MAPPING[name]} style={style} />;
+}import React, { useState } from "react";
+import { ScrollView, View, Text, TouchableOpacity, Switch, Alert } from "react-native";
+import { useRouter } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { useAuth } from "@/lib/auth-context";
+import { useColorScheme } from "@/hooks/use-color-scheme";
+
+export default function SettingsScreen() {
+  const router = useRouter();
+  const { logout, user } = useAuth();
+  const colorScheme = useColorScheme();
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [biometricEnabled, setBiometricEnabled] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(colorScheme === "dark");
+
+  const handleLogout = () => {
+    Alert.alert("Sign Out", "Are you sure you want to sign out?", [
+      { text: "Cancel", onPress: () => {} },
+      {
+        text: "Sign Out",
+        onPress: async () => {
+          try {
+            await logout();
+            router.replace("/login");
+          } catch (error) {
+            Alert.alert("Error", "Failed to sign out");
+          }
+        },
+        style: "destructive",
+      },
+    ]);
+  };
+
+  return (
+    <ScreenContainer className="p-6">
+      <ScrollView contentContainerStyle={{ flexGrow: 1 }}>
+        <View className="gap-6">
+          {/* Header */}
+          <Text className="text-2xl font-bold text-foreground">Settings</Text>
+
+          {/* User Profile Section */}
+          <View className="bg-surface rounded-lg p-4 gap-3">
+            <Text className="text-sm font-semibold text-foreground">Profile</Text>
+            <View className="gap-2">
+              <View className="flex-row justify-between">
+                <Text className="text-sm text-muted">Username</Text>
+                <Text className="text-sm font-semibold text-foreground">{user?.username}</Text>
+              </View>
+              <View className="flex-row justify-between">
+                <Text className="text-sm text-muted">Email</Text>
+                <Text className="text-sm font-semibold text-foreground">{user?.email}</Text>
+              </View>
+            </View>
+          </View>
+
+          {/* Notifications Section */}
+          <View className="bg-surface rounded-lg p-4">
+            <View className="flex-row justify-between items-center">
+              <View className="flex-1 gap-1">
+                <Text className="text-sm font-semibold text-foreground">Notifications</Text>
+                <Text className="text-xs text-muted">Receive message alerts</Text>
+              </View>
+              <Switch
+                value={notificationsEnabled}
+                onValueChange={setNotificationsEnabled}
+              />
+            </View>
+          </View>
+
+          {/* Biometric Lock Section */}
+          <View className="bg-surface rounded-lg p-4">
+            <View className="flex-row justify-between items-center">
+              <View className="flex-1 gap-1">
+                <Text className="text-sm font-semibold text-foreground">Biometric Lock</Text>
+                <Text className="text-xs text-muted">Face ID / Fingerprint</Text>
+              </View>
+              <Switch
+                value={biometricEnabled}
+                onValueChange={setBiometricEnabled}
+              />
+            </View>
+          </View>
+
+          {/* Theme Section */}
+          <View className="bg-surface rounded-lg p-4">
+            <View className="flex-row justify-between items-center">
+              <View className="flex-1 gap-1">
+                <Text className="text-sm font-semibold text-foreground">Dark Mode</Text>
+                <Text className="text-xs text-muted">Use dark theme</Text>
+              </View>
+              <Switch
+                value={isDarkMode}
+                onValueChange={setIsDarkMode}
+              />
+            </View>
+          </View>
+
+          {/* Security Section */}
+          <View className="bg-surface rounded-lg p-4 gap-3">
+            <Text className="text-sm font-semibold text-foreground">Security</Text>
+            <TouchableOpacity className="py-3 border-b border-border">
+              <Text className="text-sm text-foreground">View Public Key Fingerprint</Text>
+            </TouchableOpacity>
+            <TouchableOpacity className="py-3">
+              <Text className="text-sm text-foreground">Change Password</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* About Section */}
+          <View className="bg-surface rounded-lg p-4 gap-3">
+            <Text className="text-sm font-semibold text-foreground">About</Text>
+            <View className="flex-row justify-between">
+              <Text className="text-sm text-muted">App Version</Text>
+              <Text className="text-sm font-semibold text-foreground">1.0.0</Text>
+            </View>
+          </View>
+
+          {/* Sign Out Button */}
+          <TouchableOpacity
+            onPress={handleLogout}
+            className="bg-error rounded-lg py-4 items-center mt-4"
+          >
+            <Text className="text-white font-semibold text-base">Sign Out</Text>
+          </TouchableOpacity>
+        </View>
+      </ScrollView>
+    </ScreenContainer>
+  );
+}import React, { useState } from "react";
+import { ScrollView, View, Text, TouchableOpacity, ActivityIndicator } from "react-native";
+import { useRouter } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { AuthInput } from "@/components/auth-input";
+import { useAuth } from "@/lib/auth-context";
+
+export default function RegisterScreen() {
+  const router = useRouter();
+  const { register } = useAuth();
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  const validatePassword = (pwd: string): string | null => {
+    if (pwd.length < 12) return "Password must be at least 12 characters";
+    if (!/[A-Z]/.test(pwd)) return "Password must contain uppercase letters";
+    if (!/[a-z]/.test(pwd)) return "Password must contain lowercase letters";
+    if (!/[0-9]/.test(pwd)) return "Password must contain numbers";
+    if (!/[!@#$%^&*]/.test(pwd)) return "Password must contain special characters (!@#$%^&*)";
+    return null;
+  };
+
+  const handleRegister = async () => {
+    setError("");
+
+    if (!username || !email || !password || !confirmPassword) {
+      setError("Please fill in all fields");
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setError("Passwords do not match");
+      return;
+    }
+
+    const passwordError = validatePassword(password);
+    if (passwordError) {
+      setError(passwordError);
+      return;
+    }
+
+    setIsLoading(true);
+
+    try {
+      await register(username, email, password);
+      router.replace("/");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Registration failed");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <ScreenContainer containerClassName="bg-background">
+      <ScrollView contentContainerStyle={{ flexGrow: 1 }} className="p-6">
+        <View className="flex-1 justify-center gap-6">
+          {/* Header */}
+          <View className="items-center gap-2 mb-4">
+            <Text className="text-4xl font-bold text-foreground">Create Account</Text>
+            <Text className="text-base text-muted">Join SecureChat</Text>
+          </View>
+
+          {/* Error Message */}
+          {error && (
+            <View className="bg-error/10 border border-error rounded-lg p-4">
+              <Text className="text-sm text-error">{error}</Text>
+            </View>
+          )}
+
+          {/* Registration Form */}
+          <View className="gap-4">
+            <AuthInput
+              label="Username"
+              placeholder="Choose a username"
+              value={username}
+              onChangeText={setUsername}
+              editable={!isLoading}
+            />
+
+            <AuthInput
+              label="Email"
+              placeholder="Enter your email"
+              value={email}
+              onChangeText={setEmail}
+              editable={!isLoading}
+            />
+
+            <AuthInput
+              label="Password"
+              placeholder="Create a strong password"
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+              editable={!isLoading}
+            />
+
+            <AuthInput
+              label="Confirm Password"
+              placeholder="Re-enter your password"
+              value={confirmPassword}
+              onChangeText={setConfirmPassword}
+              secureTextEntry
+              editable={!isLoading}
+            />
+
+            {/* Password Requirements */}
+            <View className="bg-surface rounded-lg p-4 gap-2">
+              <Text className="text-xs font-semibold text-foreground">Password Requirements:</Text>
+              <Text className="text-xs text-muted">• At least 12 characters</Text>
+              <Text className="text-xs text-muted">• Uppercase and lowercase letters</Text>
+              <Text className="text-xs text-muted">• Numbers and special characters (!@#$%^&*)</Text>
+            </View>
+
+            {/* Register Button */}
+            <TouchableOpacity
+              onPress={handleRegister}
+              disabled={isLoading}
+              className="bg-primary rounded-lg py-4 items-center mt-2"
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#ffffff" />
+              ) : (
+                <Text className="text-white font-semibold text-base">Create Account</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          {/* Sign In Link */}
+          <View className="flex-row justify-center gap-1 mt-4">
+            <Text className="text-muted">Already have an account?</Text>
+            <TouchableOpacity onPress={() => router.back()}>
+              <Text className="text-primary font-semibold">Sign In</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </ScrollView>
+    </ScreenContainer>
+  );
+}import React, { useState } from "react";
+import { ScrollView, View, Text, TouchableOpacity, ActivityIndicator } from "react-native";
+import { useRouter } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { AuthInput } from "@/components/auth-input";
+import { useAuth } from "@/lib/auth-context";
+
+export default function LoginScreen() {
+  const router = useRouter();
+  const { login } = useAuth();
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleLogin = async () => {
+    if (!username || !password) {
+      setError("Please fill in all fields");
+      return;
+    }
+
+    setIsLoading(true);
+    setError("");
+
+    try {
+      await login(username, password);
+      router.replace("/");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <ScreenContainer containerClassName="bg-background">
+      <ScrollView contentContainerStyle={{ flexGrow: 1 }} className="p-6">
+        <View className="flex-1 justify-center gap-6">
+          {/* Header */}
+          <View className="items-center gap-2 mb-4">
+            <Text className="text-4xl font-bold text-foreground">SecureChat</Text>
+            <Text className="text-base text-muted">End-to-End Encrypted Messaging</Text>
+          </View>
+
+          {/* Error Message */}
+          {error && (
+            <View className="bg-error/10 border border-error rounded-lg p-4">
+              <Text className="text-sm text-error">{error}</Text>
+            </View>
+          )}
+
+          {/* Login Form */}
+          <View className="gap-4">
+            <AuthInput
+              label="Username"
+              placeholder="Enter your username"
+              value={username}
+              onChangeText={setUsername}
+              editable={!isLoading}
+            />
+
+            <AuthInput
+              label="Password"
+              placeholder="Enter your password"
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+              editable={!isLoading}
+            />
+
+            {/* Login Button */}
+            <TouchableOpacity
+              onPress={handleLogin}
+              disabled={isLoading}
+              className="bg-primary rounded-lg py-4 items-center mt-2"
+            >
+              {isLoading ? (
+                <ActivityIndicator color="#ffffff" />
+              ) : (
+                <Text className="text-white font-semibold text-base">Sign In</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
+          {/* Sign Up Link */}
+          <View className="flex-row justify-center gap-1 mt-4">
+            <Text className="text-muted">Don't have an account?</Text>
+            <TouchableOpacity onPress={() => router.push("/register")}>
+              <Text className="text-primary font-semibold">Sign Up</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </ScrollView>
+    </ScreenContainer>
+  );
+}import React from "react";
+import { TextInput, View, Text } from "react-native";
+import { cn } from "@/lib/utils";
+
+interface AuthInputProps {
+  label: string;
+  placeholder: string;
+  value: string;
+  onChangeText: (text: string) => void;
+  secureTextEntry?: boolean;
+  error?: string;
+  editable?: boolean;
+}
+
+export function AuthInput({
+  label,
+  placeholder,
+  value,
+  onChangeText,
+  secureTextEntry,
+  error,
+  editable = true,
+}: AuthInputProps) {
+  return (
+    <View className="gap-2">
+      <Text className="text-sm font-semibold text-foreground">{label}</Text>
+      <TextInput
+        placeholder={placeholder}
+        value={value}
+        onChangeText={onChangeText}
+        secureTextEntry={secureTextEntry}
+        editable={editable}
+        className={cn(
+          "border rounded-lg px-4 py-3 text-foreground",
+          error ? "border-error" : "border-border"
+        )}
+        placeholderTextColor="#687076"
+      />
+      {error && <Text className="text-xs text-error">{error}</Text>}
+    </View>
+  );
+}**
+ * Cryptographic utilities for SecureChat
+ * Handles RSA key generation, AES encryption/decryption, and key fingerprinting
+ */
+
+import * as crypto from "crypto";
+
+/**
+ * Generate RSA-4096 key pair
+ * Returns PEM-formatted keys
+ */
+export function generateRSAKeyPair(): { publicKey: string; privateKey: string } {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+    modulusLength: 4096,
+    publicKeyEncoding: {
+      type: "spki",
+      format: "pem",
+    },
+    privateKeyEncoding: {
+      type: "pkcs8",
+      format: "pem",
+    },
+  });
+
+  return {
+    publicKey,
+    privateKey,
+  };
+}
+
+/**
+ * Generate SHA-256 fingerprint of a public key
+ * Used for out-of-band verification
+ */
+export function generateKeyFingerprint(publicKeyPem: string): string {
+  return crypto.createHash("sha256").update(publicKeyPem).digest("hex");
+}
+
+/**
+ * Encrypt data using AES-256-GCM
+ * Returns base64-encoded JSON with iv, authTag, and ciphertext
+ */
+export function encryptAES256GCM(
+  plaintext: string,
+  password: string
+): string {
+  const iv = crypto.randomBytes(16);
+  const salt = crypto.randomBytes(32);
+
+  // Derive key from password using PBKDF2
+  const key = crypto.pbkdf2Sync(password, salt, 100000, 32, "sha256");
+
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  let encrypted = cipher.update(plaintext, "utf8", "hex");
+  encrypted += cipher.final("hex");
+
+  const authTag = cipher.getAuthTag();
+
+  const result = {
+    iv: iv.toString("hex"),
+    salt: salt.toString("hex"),
+    authTag: authTag.toString("hex"),
+    ciphertext: encrypted,
+  };
+
+  return Buffer.from(JSON.stringify(result)).toString("base64");
+}
+
+/**
+ * Decrypt data encrypted with encryptAES256GCM
+ */
+export function decryptAES256GCM(encrypted: string, password: string): string {
+  const result = JSON.parse(Buffer.from(encrypted, "base64").toString("utf8"));
+
+  const iv = Buffer.from(result.iv, "hex");
+  const salt = Buffer.from(result.salt, "hex");
+  const authTag = Buffer.from(result.authTag, "hex");
+  const ciphertext = result.ciphertext;
+
+  // Derive key from password using PBKDF2
+  const key = crypto.pbkdf2Sync(password, salt, 100000, 32, "sha256");
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+
+  let decrypted = decipher.update(ciphertext, "hex", "utf8");
+  decrypted += decipher.final("utf8");
+
+  return decrypted;
+}
+
+/**
+ * Encrypt data using RSA public key
+ * Returns base64-encoded ciphertext
+ */
+export function encryptRSA(plaintext: string, publicKeyPem: string): string {
+  const buffer = Buffer.from(plaintext, "utf8");
+  const encrypted = crypto.publicEncrypt(
+    {
+      key: publicKeyPem,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    buffer
+  );
+
+  return encrypted.toString("base64");
+}
+
+/**
+ * Decrypt data using RSA private key
+ * Expects base64-encoded ciphertext
+ */
+export function decryptRSA(ciphertext: string, privateKeyPem: string): string {
+  const buffer = Buffer.from(ciphertext, "base64");
+  const decrypted = crypto.privateDecrypt(
+    {
+      key: privateKeyPem,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    buffer
+  );
+
+  return decrypted.toString("utf8");
+}
+
+/**
+ * Generate a random token for sessions
+ */
+export function generateToken(length = 32): string {
+  return crypto.randomBytes(length).toString("hex");
+}
+
+/**
+ * Hash a password using bcrypt-like approach (PBKDF2)
+ */
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(32);
+  const hash = crypto.pbkdf2Sync(password, salt, 100000, 64, "sha256");
+
+  return salt.toString("hex") + ":" + hash.toString("hex");
+}
+
+/**
+ * Verify a password against a hash
+ */
+export function verifyPassword(password: string, hash: string): boolean {
+  const [saltHex, hashHex] = hash.split(":");
+  const salt = Buffer.from(saltHex, "hex");
+  const derivedHash = crypto.pbkdf2Sync(password, salt, 100000, 64, "sha256");
+
+  return derivedHash.toString("hex") === hashHex;
+}import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/mysql2";
+import { InsertUser, users } from "../drizzle/schema";
+import { ENV } from "./_core/env";
+
+let _db: ReturnType<typeof drizzle> | null = null;
+
+// Lazily create the drizzle instance so local tooling can run without a DB.
+export async function getDb() {
+  if (!_db && process.env.DATABASE_URL) {
+    try {
+      _db = drizzle(process.env.DATABASE_URL);
+    } catch (error) {
+      console.warn("[Database] Failed to connect:", error);
+      _db = null;
+    }
+  }
+  return _db;
+}
+
+export async function upsertUser(user: InsertUser): Promise<void> {
+  if (!user.openId) {
+    throw new Error("User openId is required for upsert");
+  }
+
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot upsert user: database not available");
+    return;
+  }
+
+  try {
+    const values: InsertUser = {
+      openId: user.openId,
+    };
+    const updateSet: Record<string, unknown> = {};
+
+    const textFields = ["name", "email", "loginMethod"] as const;
+    type TextField = (typeof textFields)[number];
+
+    const assignNullable = (field: TextField) => {
+      const value = user[field];
+      if (value === undefined) return;
+      const normalized = value ?? null;
+      values[field] = normalized;
+      updateSet[field] = normalized;
+    };
+
+    textFields.forEach(assignNullable);
+
+    if (user.lastSignedIn !== undefined) {
+      values.lastSignedIn = user.lastSignedIn;
+      updateSet.lastSignedIn = user.lastSignedIn;
+    }
+    if (user.role !== undefined) {
+      values.role = user.role;
+      updateSet.role = user.role;
+    } else if (user.openId === ENV.ownerOpenId) {
+      values.role = "admin";
+      updateSet.role = "admin";
+    }
+
+    if (!values.lastSignedIn) {
+      values.lastSignedIn = new Date();
+    }
+
+    if (Object.keys(updateSet).length === 0) {
+      updateSet.lastSignedIn = new Date();
+    }
+
+    await db.insert(users).values(values).onDuplicateKeyUpdate({
+      set: updateSet,
+    });
+  } catch (error) {
+    console.error("[Database] Failed to upsert user:", error);
+    throw error;
+  }
+}
+
+export async function getUserByOpenId(openId: string) {
+  const db = await getDb();
+  if (!db) {
+    console.warn("[Database] Cannot get user: database not available");
+    return undefined;
+  }
+
+  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+
+  return result.length > 0 ? result[0] : undefined;
+}
+
+/**
+ * User Profile Queries
+ */
+
+export async function getUserProfile(userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+
+  const { userProfiles } = await import("../drizzle/schema");
+  const profile = await db
+    .select()
+    .from(userProfiles)
+    .where(eq(userProfiles.userId, userId))
+    .limit(1);
+
+  return profile[0] || null;
+}
+
+export async function getUserProfileByUsername(username: string) {
+  const db = await getDb();
+  if (!db) return null;
+
+  const { userProfiles } = await import("../drizzle/schema");
+  const profile = await db
+    .select()
+    .from(userProfiles)
+    .where(eq(userProfiles.username, username))
+    .limit(1);
+
+  return profile[0] || null;
+}
+
+export async function createUserProfile(data: any) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { userProfiles } = await import("../drizzle/schema");
+  const result = await db.insert(userProfiles).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function updateUserProfile(userId: number, data: any) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { userProfiles } = await import("../drizzle/schema");
+  await db.update(userProfiles).set(data).where(eq(userProfiles.userId, userId));
+}
+
+/**
+ * Contact Queries
+ */
+
+export async function getUserContacts(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+
+  const { contacts } = await import("../drizzle/schema");
+  return db.select().from(contacts).where(eq(contacts.userId, userId));
+}
+
+export async function getContact(userId: number, contactUserId: number) {
+  const db = await getDb();
+  if (!db) return null;
+
+  const { contacts } = await import("../drizzle/schema");
+  const { and } = await import("drizzle-orm");
+  const contact = await db
+    .select()
+    .from(contacts)
+    .where(
+      and(eq(contacts.userId, userId), eq(contacts.contactUserId, contactUserId))
+    )
+    .limit(1);
+
+  return contact[0] || null;
+}
+
+export async function addContact(data: any) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { contacts } = await import("../drizzle/schema");
+  const result = await db.insert(contacts).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function updateContact(
+  userId: number,
+  contactUserId: number,
+  data: any
+) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { contacts } = await import("../drizzle/schema");
+  const { and } = await import("drizzle-orm");
+  await db
+    .update(contacts)
+    .set(data)
+    .where(
+      and(eq(contacts.userId, userId), eq(contacts.contactUserId, contactUserId))
+    );
+}
+
+export async function deleteContact(userId: number, contactUserId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { contacts } = await import("../drizzle/schema");
+  const { and } = await import("drizzle-orm");
+  await db
+    .delete(contacts)
+    .where(
+      and(eq(contacts.userId, userId), eq(contacts.contactUserId, contactUserId))
+    );
+}
+
+/**
+ * Message Queries
+ */
+
+export async function getConversation(userId: number, contactId: number, limit = 50) {
+  const db = await getDb();
+  if (!db) return [];
+
+  const { messages } = await import("../drizzle/schema");
+  const { or, and } = await import("drizzle-orm");
+  return db
+    .select()
+    .from(messages)
+    .where(
+      or(
+        and(eq(messages.senderId, userId), eq(messages.recipientId, contactId)),
+        and(eq(messages.senderId, contactId), eq(messages.recipientId, userId))
+      )
+    )
+    .orderBy(messages.createdAt)
+    .limit(limit);
+}
+
+export async function sendMessage(data: any) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { messages } = await import("../drizzle/schema");
+  const result = await db.insert(messages).values(data);
+  return result[0]?.insertId || 0;
+}
+
+export async function getUnreadMessages(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+
+  const { messages } = await import("../drizzle/schema");
+  const { and } = await import("drizzle-orm");
+  return db
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.recipientId, userId),
+        eq(messages.isRead, 0),
+        eq(messages.isDeleted, 0)
+      )
+    );
+}
+
+export async function markMessageAsRead(messageId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { messages } = await import("../drizzle/schema");
+  await db
+    .update(messages)
+    .set({ isRead: 1, readAt: new Date() })
+    .where(eq(messages.id, messageId));
+}
+
+export async function deleteMessage(messageId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  const { messages } = await import("../drizzle/schema");
+  await db
+    .update(messages)
+    .set({ isDeleted: 1 })
+    .where(eq(messages.id, messageId));
+}import { COOKIE_NAME } from "../shared/const.js";
+import { getSessionCookieOptions } from "./_core/cookies";
+import { systemRouter } from "./_core/systemRouter";
+import { publicProcedure, router } from "./_core/trpc";
+
+export const appRouter = router({
+  // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
+  system: systemRouter,
+  auth: router({
+    me: publicProcedure.query((opts) => opts.ctx.user),
+    logout: publicProcedure.mutation(({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return {
+        success: true,
+      } as const;
+    }),
+  }),
+
+  // Messaging routers will be added here
+
+});
+
+export type AppRouter = typeof appRouter;import { int, mysqlEnum, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
+
+/**
+ * Core user table backing auth flow.
+ * Extend this file with additional tables as your product grows.
+ * Columns use camelCase to match both database fields and generated types.
+ */
+export const users = mysqlTable("users", {
+  /**
+   * Surrogate primary key. Auto-incremented numeric value managed by the database.
+   * Use this for relations between tables.
+   */
+  id: int("id").autoincrement().primaryKey(),
+  /** Manus OAuth identifier (openId) returned from the OAuth callback. Unique per user. */
+  openId: varchar("openId", { length: 64 }).notNull().unique(),
+  name: text("name"),
+  email: varchar("email", { length: 320 }),
+  loginMethod: varchar("loginMethod", { length: 64 }),
+  role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
+});
+
+export type User = typeof users.$inferSelect;
+export type InsertUser = typeof users.$inferInsert;
+
+/**
+ * User profiles with encryption keys
+ */
+export const userProfiles = mysqlTable("userProfiles", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull().unique(),
+  username: varchar("username", { length: 255 }).notNull().unique(),
+  publicKey: text("publicKey").notNull(),
+  publicKeyFingerprint: varchar("publicKeyFingerprint", { length: 64 }).notNull(),
+  isOnline: int("isOnline").default(0).notNull(),
+  lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type UserProfile = typeof userProfiles.$inferSelect;
+export type InsertUserProfile = typeof userProfiles.$inferInsert;
+
+/**
+ * Contacts (friends) relationship
+ */
+export const contacts = mysqlTable("contacts", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  contactUserId: int("contactUserId").notNull(),
+  isVerified: int("isVerified").default(0).notNull(),
+  isBlocked: int("isBlocked").default(0).notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type Contact = typeof contacts.$inferSelect;
+export type InsertContact = typeof contacts.$inferInsert;
+
+/**
+ * Encrypted messages
+ */
+export const messages = mysqlTable("messages", {
+  id: int("id").autoincrement().primaryKey(),
+  senderId: int("senderId").notNull(),
+  recipientId: int("recipientId").notNull(),
+  encryptedPayload: text("encryptedPayload").notNull(),
+  isDeleted: int("isDeleted").default(0).notNull(),
+  isRead: int("isRead").default(0).notNull(),
+  readAt: timestamp("readAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type Message = typeof messages.$inferSelect;
+export type InsertMessage = typeof messages.$inferInsert;
+
+/**
+ * User sessions for authentication
+ */
+export const sessions = mysqlTable("sessions", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  token: varchar("token", { length: 255 }).notNull().unique(),
+  expiresAt: timestamp("expiresAt").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export type Session = typeof sessions.$inferSelect;
+export type InsertSession = typeof sessions.$inferInsert;
