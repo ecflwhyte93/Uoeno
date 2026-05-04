@@ -1,4 +1,4 @@
-npx expo install expo-dev-client    "cli": {
+npx plugins add vercel/vercel-pluginnpx expo install expo-dev-client    "cli": {
     "version": ">= 5.0.0",
     "appVersionSource": "local"
   },
