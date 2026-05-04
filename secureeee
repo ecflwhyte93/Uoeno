@@ -1,3 +1,6 @@
+eas build --platform ios --profile preview
+eas build --platform android --profile preview
+npm install -g eas-cli
 cd /home/ubuntu/secure-chat-app
 eas init
 npx plugins add vercel/vercel-pluginnpx expo install expo-dev-client    "cli": {
